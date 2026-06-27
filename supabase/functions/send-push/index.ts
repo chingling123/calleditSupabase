@@ -1,17 +1,13 @@
 // Cravou / Called It — Edge Function: send-push
 //
 // Envia push via APNs (token-based auth, ES256 .p8). Reusa a Auth Key do Team.
-// Secured: só service_role (header Authorization).
+// Secured: só service_role (header Authorization == SUPABASE_SERVICE_ROLE_KEY).
 //
-// Secrets necessários (supabase secrets set ...):
-//   APNS_KEY_ID     - Key ID da .p8 (ex: ABC123DEFG)
-//   APNS_TEAM_ID    - Apple Developer Team ID
-//   APNS_BUNDLE_ID  - com.calledit.app
-//   APNS_KEY        - conteúdo PEM da .p8 (-----BEGIN PRIVATE KEY----- ...)
-//   APNS_HOST       - api.sandbox.push.apple.com (dev) | api.push.apple.com (prod)
+// Secrets (supabase secrets set ...):
+//   APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID (com.calledit.pt), APNS_KEY (.p8 PEM)
+//   APNS_HOST (opcional) — se vazio, tenta produção e cai pro sandbox em BadDeviceToken.
 //
 // Body JSON: { "title": string, "body": string, "userIds"?: string[] }
-//   userIds ausente => broadcast p/ todos os tokens.
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
@@ -19,7 +15,7 @@ const enc = new TextEncoder();
 
 function b64url(data: ArrayBuffer | Uint8Array): string {
   const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-  let s = btoa(String.fromCharCode(...bytes));
+  const s = btoa(String.fromCharCode(...bytes));
   return s.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
@@ -32,36 +28,58 @@ function pemToPkcs8(pem: string): Uint8Array {
   return out;
 }
 
-let cachedJWT: { token: string; iat: number } | null = null;
-
-async function apnsJWT(): Promise<string> {
+async function apnsJWT(keyId: string, teamId: string, pem: string): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
-  if (cachedJWT && now - cachedJWT.iat < 3000) return cachedJWT.token;
-
-  const keyId = Deno.env.get("APNS_KEY_ID")!;
-  const teamId = Deno.env.get("APNS_TEAM_ID")!;
-  const pem = Deno.env.get("APNS_KEY")!;
-
   const header = b64url(enc.encode(JSON.stringify({ alg: "ES256", kid: keyId })));
   const claims = b64url(enc.encode(JSON.stringify({ iss: teamId, iat: now })));
   const signingInput = `${header}.${claims}`;
-
   const key = await crypto.subtle.importKey(
     "pkcs8", pemToPkcs8(pem),
     { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"],
   );
-  const sig = await crypto.subtle.sign(
-    { name: "ECDSA", hash: "SHA-256" }, key, enc.encode(signingInput),
-  );
-  const token = `${signingInput}.${b64url(sig)}`;
-  cachedJWT = { token, iat: now };
-  return token;
+  const sig = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, enc.encode(signingInput));
+  return `${signingInput}.${b64url(sig)}`;
+}
+
+// Tenta produção; se BadDeviceToken/BadEnvironment cai pro sandbox.
+async function sendOne(token: string, jwt: string, bundle: string, payload: string, hostEnv: string) {
+  const hosts = hostEnv ? [hostEnv] : ["api.push.apple.com", "api.sandbox.push.apple.com"];
+  let last = { status: 0, body: "" };
+  for (const host of hosts) {
+    const res = await fetch(`https://${host}/3/device/${token}`, {
+      method: "POST",
+      headers: {
+        authorization: `bearer ${jwt}`,
+        "apns-topic": bundle,
+        "apns-push-type": "alert",
+        "content-type": "application/json",
+      },
+      body: payload,
+    });
+    if (res.ok) return { status: 200, body: "" };
+    const body = await res.text();
+    last = { status: res.status, body };
+    if (!/BadDeviceToken|BadEnvironment/.test(body)) break;
+  }
+  return last;
 }
 
 Deno.serve(async (req: Request) => {
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   if ((req.headers.get("Authorization") ?? "") !== `Bearer ${serviceKey}`) {
     return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+  }
+
+  const keyId = Deno.env.get("APNS_KEY_ID") ?? "";
+  const teamId = Deno.env.get("APNS_TEAM_ID") ?? "";
+  const bundle = Deno.env.get("APNS_BUNDLE_ID") ?? "";
+  const pem = Deno.env.get("APNS_KEY") ?? "";
+  const hostEnv = Deno.env.get("APNS_HOST") ?? "";
+  const missing = [
+    ["APNS_KEY_ID", keyId], ["APNS_TEAM_ID", teamId], ["APNS_BUNDLE_ID", bundle], ["APNS_KEY", pem],
+  ].filter(([, v]) => !v).map(([k]) => k);
+  if (missing.length) {
+    return new Response(JSON.stringify({ ok: false, error: "missing secrets", missing }), { status: 400 });
   }
 
   const { title, body, userIds } = await req.json().catch(() => ({}));
@@ -74,35 +92,28 @@ Deno.serve(async (req: Request) => {
   if (Array.isArray(userIds) && userIds.length) query = query.in("user_id", userIds);
   const { data: rows, error } = await query;
   if (error) return new Response(JSON.stringify({ ok: false, error: error.message }), { status: 500 });
-
   const tokens: string[] = (rows ?? []).map((r: { token: string }) => r.token);
   if (!tokens.length) return new Response(JSON.stringify({ ok: true, sent: 0 }));
 
-  const jwt = await apnsJWT();
-  const host = Deno.env.get("APNS_HOST") ?? "api.sandbox.push.apple.com";
-  const topic = Deno.env.get("APNS_BUNDLE_ID")!;
-  const payload = JSON.stringify({ aps: { alert: { title, body }, sound: "default" } });
+  let jwt: string;
+  try {
+    jwt = await apnsJWT(keyId, teamId, pem);
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: "apns key invalid: " + String(e) }), { status: 400 });
+  }
 
-  let sent = 0;
+  const payload = JSON.stringify({ aps: { alert: { title, body }, sound: "default" } });
+  const results: { status: number; body?: string }[] = [];
   const stale: string[] = [];
   await Promise.all(tokens.map(async (token) => {
-    const res = await fetch(`https://${host}/3/device/${token}`, {
-      method: "POST",
-      headers: {
-        authorization: `bearer ${jwt}`,
-        "apns-topic": topic,
-        "apns-push-type": "alert",
-        "content-type": "application/json",
-      },
-      body: payload,
-    });
-    if (res.ok) sent++;
-    else if (res.status === 410) stale.push(token); // device no longer registered
+    const r = await sendOne(token, jwt, bundle, payload, hostEnv);
+    results.push({ status: r.status, body: r.body || undefined });
+    if (r.status === 410 || /BadDeviceToken/.test(r.body)) stale.push(token);
   }));
-
   if (stale.length) await supabase.from("device_tokens").delete().in("token", stale);
 
-  return new Response(JSON.stringify({ ok: true, sent, removed: stale.length }), {
+  const sent = results.filter((r) => r.status === 200).length;
+  return new Response(JSON.stringify({ ok: true, sent, results }), {
     headers: { "Content-Type": "application/json" },
   });
 });
