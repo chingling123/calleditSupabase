@@ -3,9 +3,9 @@
 // Envia push via APNs (token-based auth, ES256 .p8). Reusa a Auth Key do Team.
 // Secured: só service_role (header Authorization == SUPABASE_SERVICE_ROLE_KEY).
 //
-// Secrets (supabase secrets set ...):
-//   APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID (com.calledit.pt), APNS_KEY (.p8 PEM)
-//   APNS_HOST (opcional) — se vazio, tenta produção e cai pro sandbox em BadDeviceToken.
+// Secrets: APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID (com.calledit.pt), APNS_KEY (.p8 PEM)
+//   APNS_HOST (opcional) — se vazio, tenta sandbox e cai pro production.
+//   (sandbox primeiro: builds dev/Xcode usam APNs sandbox.)
 //
 // Body JSON: { "title": string, "body": string, "userIds"?: string[] }
 
@@ -41,10 +41,10 @@ async function apnsJWT(keyId: string, teamId: string, pem: string): Promise<stri
   return `${signingInput}.${b64url(sig)}`;
 }
 
-// Tenta produção; se BadDeviceToken/BadEnvironment cai pro sandbox.
+// Sandbox primeiro (dev); cai pro production em BadDeviceToken/BadEnvironment.
 async function sendOne(token: string, jwt: string, bundle: string, payload: string, hostEnv: string) {
-  const hosts = hostEnv ? [hostEnv] : ["api.push.apple.com", "api.sandbox.push.apple.com"];
-  let last = { status: 0, body: "" };
+  const hosts = hostEnv ? [hostEnv] : ["api.sandbox.push.apple.com", "api.push.apple.com"];
+  let last: { host: string; status: number; body: string } = { host: "", status: 0, body: "" };
   for (const host of hosts) {
     const res = await fetch(`https://${host}/3/device/${token}`, {
       method: "POST",
@@ -56,9 +56,9 @@ async function sendOne(token: string, jwt: string, bundle: string, payload: stri
       },
       body: payload,
     });
-    if (res.ok) return { status: 200, body: "" };
+    if (res.ok) return { host, status: 200, body: "" };
     const body = await res.text();
-    last = { status: res.status, body };
+    last = { host, status: res.status, body };
     if (!/BadDeviceToken|BadEnvironment/.test(body)) break;
   }
   return last;
@@ -69,23 +69,17 @@ Deno.serve(async (req: Request) => {
   if ((req.headers.get("Authorization") ?? "") !== `Bearer ${serviceKey}`) {
     return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
   }
-
   const keyId = Deno.env.get("APNS_KEY_ID") ?? "";
   const teamId = Deno.env.get("APNS_TEAM_ID") ?? "";
   const bundle = Deno.env.get("APNS_BUNDLE_ID") ?? "";
   const pem = Deno.env.get("APNS_KEY") ?? "";
   const hostEnv = Deno.env.get("APNS_HOST") ?? "";
-  const missing = [
-    ["APNS_KEY_ID", keyId], ["APNS_TEAM_ID", teamId], ["APNS_BUNDLE_ID", bundle], ["APNS_KEY", pem],
-  ].filter(([, v]) => !v).map(([k]) => k);
-  if (missing.length) {
-    return new Response(JSON.stringify({ ok: false, error: "missing secrets", missing }), { status: 400 });
-  }
+  const missing = [["APNS_KEY_ID", keyId], ["APNS_TEAM_ID", teamId], ["APNS_BUNDLE_ID", bundle], ["APNS_KEY", pem]]
+    .filter(([, v]) => !v).map(([k]) => k);
+  if (missing.length) return new Response(JSON.stringify({ ok: false, error: "missing secrets", missing }), { status: 400 });
 
   const { title, body, userIds } = await req.json().catch(() => ({}));
-  if (!title || !body) {
-    return new Response(JSON.stringify({ error: "title and body required" }), { status: 400 });
-  }
+  if (!title || !body) return new Response(JSON.stringify({ error: "title and body required" }), { status: 400 });
 
   const supabase = createClient(Deno.env.get("SUPABASE_URL")!, serviceKey);
   let query = supabase.from("device_tokens").select("token");
@@ -96,24 +90,19 @@ Deno.serve(async (req: Request) => {
   if (!tokens.length) return new Response(JSON.stringify({ ok: true, sent: 0 }));
 
   let jwt: string;
-  try {
-    jwt = await apnsJWT(keyId, teamId, pem);
-  } catch (e) {
-    return new Response(JSON.stringify({ ok: false, error: "apns key invalid: " + String(e) }), { status: 400 });
-  }
+  try { jwt = await apnsJWT(keyId, teamId, pem); }
+  catch (e) { return new Response(JSON.stringify({ ok: false, error: "apns key invalid: " + String(e) }), { status: 400 }); }
 
   const payload = JSON.stringify({ aps: { alert: { title, body }, sound: "default" } });
-  const results: { status: number; body?: string }[] = [];
+  const results: { host: string; status: number; body?: string }[] = [];
   const stale: string[] = [];
   await Promise.all(tokens.map(async (token) => {
     const r = await sendOne(token, jwt, bundle, payload, hostEnv);
-    results.push({ status: r.status, body: r.body || undefined });
+    results.push({ host: r.host, status: r.status, body: r.body || undefined });
     if (r.status === 410 || /BadDeviceToken/.test(r.body)) stale.push(token);
   }));
   if (stale.length) await supabase.from("device_tokens").delete().in("token", stale);
 
   const sent = results.filter((r) => r.status === 200).length;
-  return new Response(JSON.stringify({ ok: true, sent, results }), {
-    headers: { "Content-Type": "application/json" },
-  });
+  return new Response(JSON.stringify({ ok: true, sent, results }), { headers: { "Content-Type": "application/json" } });
 });
