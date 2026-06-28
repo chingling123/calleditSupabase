@@ -4,14 +4,18 @@
 // Secured: só service_role (header Authorization == SUPABASE_SERVICE_ROLE_KEY).
 //
 // Secrets: APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID (com.calledit.pt), APNS_KEY (.p8 PEM)
-//   APNS_HOST (opcional) — se vazio, tenta sandbox e cai pro production.
-//   (sandbox primeiro: builds dev/Xcode usam APNs sandbox.)
+//   APNS_HOST (opcional) força um host único; senão usa o environment de cada token.
+//
+// Host por token: device_tokens.environment ('production' | 'sandbox'). Produção é
+// prioritária p/ tokens de produção; dev usa sandbox. Fallback ao outro em BadDeviceToken.
 //
 // Body JSON: { "title": string, "body": string, "userIds"?: string[] }
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 const enc = new TextEncoder();
+const PROD = "api.push.apple.com";
+const SANDBOX = "api.sandbox.push.apple.com";
 
 function b64url(data: ArrayBuffer | Uint8Array): string {
   const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
@@ -41,9 +45,9 @@ async function apnsJWT(keyId: string, teamId: string, pem: string): Promise<stri
   return `${signingInput}.${b64url(sig)}`;
 }
 
-// Sandbox primeiro (dev); cai pro production em BadDeviceToken/BadEnvironment.
-async function sendOne(token: string, jwt: string, bundle: string, payload: string, hostEnv: string) {
-  const hosts = hostEnv ? [hostEnv] : ["api.sandbox.push.apple.com", "api.push.apple.com"];
+// Host primário pelo environment do token; cai pro outro em BadDeviceToken/BadEnvironment.
+async function sendOne(token: string, env: string, jwt: string, bundle: string, payload: string, hostEnv: string) {
+  const hosts = hostEnv ? [hostEnv] : (env === "production" ? [PROD, SANDBOX] : [SANDBOX, PROD]);
   let last: { host: string; status: number; body: string } = { host: "", status: 0, body: "" };
   for (const host of hosts) {
     const res = await fetch(`https://${host}/3/device/${token}`, {
@@ -82,12 +86,12 @@ Deno.serve(async (req: Request) => {
   if (!title || !body) return new Response(JSON.stringify({ error: "title and body required" }), { status: 400 });
 
   const supabase = createClient(Deno.env.get("SUPABASE_URL")!, serviceKey);
-  let query = supabase.from("device_tokens").select("token");
+  let query = supabase.from("device_tokens").select("token, environment");
   if (Array.isArray(userIds) && userIds.length) query = query.in("user_id", userIds);
   const { data: rows, error } = await query;
   if (error) return new Response(JSON.stringify({ ok: false, error: error.message }), { status: 500 });
-  const tokens: string[] = (rows ?? []).map((r: { token: string }) => r.token);
-  if (!tokens.length) return new Response(JSON.stringify({ ok: true, sent: 0 }));
+  const devices = (rows ?? []) as { token: string; environment: string }[];
+  if (!devices.length) return new Response(JSON.stringify({ ok: true, sent: 0 }));
 
   let jwt: string;
   try { jwt = await apnsJWT(keyId, teamId, pem); }
@@ -96,10 +100,10 @@ Deno.serve(async (req: Request) => {
   const payload = JSON.stringify({ aps: { alert: { title, body }, sound: "default" } });
   const results: { host: string; status: number; body?: string }[] = [];
   const stale: string[] = [];
-  await Promise.all(tokens.map(async (token) => {
-    const r = await sendOne(token, jwt, bundle, payload, hostEnv);
+  await Promise.all(devices.map(async (d) => {
+    const r = await sendOne(d.token, d.environment, jwt, bundle, payload, hostEnv);
     results.push({ host: r.host, status: r.status, body: r.body || undefined });
-    if (r.status === 410 || /BadDeviceToken/.test(r.body)) stale.push(token);
+    if (r.status === 410 || /BadDeviceToken/.test(r.body)) stale.push(d.token);
   }));
   if (stale.length) await supabase.from("device_tokens").delete().in("token", stale);
 
